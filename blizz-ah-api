@@ -1,0 +1,172 @@
+function retrieveBlizzPrices() {
+  setStatus("");
+ 
+  var sheet = SpreadsheetApp.getActive();
+  var credsSheet = sheet.getSheetByName("ShoppingList");
+  var region = credsSheet.getRange(8,3).getValue();
+  var realmSlug = credsSheet.getRange(9,3).getValue();
+  var blizzClient = credsSheet.getRange(11,3).getValue();
+  var blizzSecret = credsSheet.getRange(12,3).getValue();
+  
+  if(!(region && realmSlug && blizzClient && blizzSecret))
+  {
+    setStatus("Blizzard API requires a region, realm, client, and secret.");
+    return;
+  }
+  
+  const BLIZZ_URL_BASE = `https://${region}.api.blizzard.com`
+  const BLIZZ_OAUTH_URL = `https://${region}.battle.net/oauth/token`;
+  
+  var response = UrlFetchApp.fetch(BLIZZ_OAUTH_URL, {
+    "method":"POST",
+    "headers": {"Authorization":"Basic " + Utilities.base64Encode(blizzClient + ":" + blizzSecret)},
+    "payload": {"grant_type":"client_credentials"}
+  });
+  
+  if(response.getResponseCode() != 200)
+  {
+    credsSheet.getRange(16,3).setValue("Could not retrieve token for Blizzard API. Check client and secret.");
+    return;
+  }
+  
+  var token_info = JSON.parse(response.getContentText());
+  var token = token_info["access_token"];
+  
+  var connectedRealmId = getConnectedRealmId(realmSlug, region, token);
+  if(connectedRealmId == -1)
+  {
+    return;
+  }
+  
+  var BLIZZ_AH_API_URL = BLIZZ_URL_BASE + `/data/wow/connected-realm/${connectedRealmId}/auctions`;
+  
+  auctionHouseResponse = UrlFetchApp.fetch(BLIZZ_AH_API_URL, {
+    "method":"GET",
+    "headers": {"Authorization":"Bearer " + token,
+                "Battlenet-Namespace": `dynamic-${region}`}
+   });
+  
+  var auctionHouseData = JSON.parse(auctionHouseResponse.getContentText());
+  if(auctionHouseResponse.getResponseCode() != 200)
+  {
+    setStatus("Could not get auction house data: " + auctionHouseData["error_description"]);
+    return;
+  }
+  
+  // Need to flatten getValues from 2d to 1d
+  var itemIds = credsSheet.getRange("G3:G31").getValues().map(x => x[0]);
+  var itemAuctions = {};
+  itemIds.forEach(x => itemAuctions[x] = []);
+  
+  for(let i = 0; i < auctionHouseData["auctions"].length; ++i)
+  {
+    let currentAuction = auctionHouseData["auctions"][i];
+    let idx = itemIds.indexOf(currentAuction["item"]["id"]);
+    if(idx != -1)
+    {
+      // convert unit price from copper to gold
+      if(currentAuction.hasOwnProperty("buyout"))
+      {
+        currentAuction["buyout"] /= 10000;
+      }
+      else
+      {
+        currentAuction["unit_price"] /= 10000;
+      }
+      
+      itemAuctions[itemIds[idx]].push(currentAuction);
+    }
+  }
+  
+  for(let [itemId, auctions] of Object.entries(itemAuctions))
+  {
+    // Sort ascending
+    auctions.sort(function(a,b){
+      let a_key = (a.hasOwnProperty("buyout")) ? "buyout" : "unit_price";
+      let b_key = (b.hasOwnProperty("buyout")) ? "buyout" : "unit_price";
+      return a[a_key] > b[b_key];
+    }).reverse();
+  }
+  
+  var prices = [];
+  itemIds.forEach(id => {
+    if(itemAuctions[id].length > 0)
+    {
+      if(itemAuctions[id][0].hasOwnProperty("buyout"))
+      {
+        prices.push([itemAuctions[id][0]["buyout"]]);
+      }
+      else
+      {
+        prices.push([itemAuctions[id][0]["unit_price"]]);
+      }
+    }
+    else
+    {
+      prices.push(["No auctions found."]);
+    }
+  });
+
+  credsSheet.getRange("I3:I31").setValues(prices);
+  
+  setStatus("Blizzard API: Update successful");
+  return;
+  
+}
+
+function getConnectedRealmId(realmSlug, region, token) {
+  const BLIZZ_CONNECTED_REALM_INDEX_URL = `https://${region}.api.blizzard.com/data/wow/connected-realm/index`;
+  const BATTLENET_NAMESPACE = `dynamic-${region}`;
+  
+  var response = UrlFetchApp.fetch(BLIZZ_CONNECTED_REALM_INDEX_URL, {
+    "method":"GET",
+    "headers": {"Authorization": "Bearer " + token,
+               "Battlenet-Namespace": BATTLENET_NAMESPACE}
+  });
+  
+  if(response.getResponseCode() != 200)
+  {
+    setStatus("Could not retrieve connected realm index. " + data["error_description"]);
+    return -1;
+  }
+
+  var realmList = JSON.parse(response.getContentText());
+  
+  for(i = 0; i < realmList["connected_realms"].length; ++i)
+  {
+    var realmData = realmList["connected_realms"][i];
+    var connectedRealmsResponse = UrlFetchApp.fetch(realmData["href"], {
+      "method":"GET",
+      "headers": {"Authorization": "Bearer " + token}
+    });
+    
+    var connectedRealmsData = JSON.parse(connectedRealmsResponse.getContentText());
+    
+    if(connectedRealmsResponse.getResponseCode() != 200)
+    {
+      setStatus("Could not retrieve connected realm info. " + connectedRealmsData["error_description"]);
+      return;
+    }
+    
+    var realmId = connectedRealmsData["id"];
+    
+    for(j = 0; j < connectedRealmsData["realms"].length; ++j)
+    {
+      let currentSlug = connectedRealmsData["realms"][j]["slug"];
+      if(currentSlug == realmSlug)
+      {
+        return realmId;
+      }
+    }
+  }
+  
+  setStatus("Could not find realm id for slug: " + realmSlug + ".");
+  return -1;
+}
+
+function setStatus(message) {
+  var sheet = SpreadsheetApp.getActive();
+  var credsSheet = sheet.getSheetByName("ShoppingList");
+  
+  credsSheet.getRange(13,3).setValue(message);
+}
